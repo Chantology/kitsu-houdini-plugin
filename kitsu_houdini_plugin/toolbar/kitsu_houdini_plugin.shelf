@@ -2,16 +2,23 @@
 <!-- Adds a "Kitsu" shelf tab with two buttons — the closest Houdini
      equivalent of the Maya version's "Kitsu/Zou" menu:
        - "Kitsu" docks the panel as a pane tab in whichever pane the button
-         was clicked from (or refocuses it if already open elsewhere),
-         the same behavior as SideFX's own shelf-launched panels, via
-         toolutils.createOrShowPythonPanel(..., split_type=1). Deliberately
-         NOT hou.ui.curDesktop().createFloatingPanel(...): that spawns a
-         brand new top-level OS window, which is both not what a Pane Tab
-         Type panel is expected to look like and was observed shoving the
-         whole Houdini main window to a different screen position when
-         invoked (worst over Remote Desktop). The panel is also always
-         reachable via the "+" New Pane Tab Type menu of any pane, since
-         it's a registered Python Panel interface — see
+         was clicked from, or just refocuses it if already open elsewhere.
+         Deliberately NOT hou.ui.curDesktop().createFloatingPanel(...):
+         that spawns a brand new top-level OS window, which is both not
+         what a Pane Tab Type panel is expected to look like and was
+         observed shoving the whole Houdini main window to a different
+         screen position when invoked (worst over Remote Desktop).
+         Also deliberately NOT toolutils.createOrShowPythonPanel(), even
+         though it looks like the obvious SideFX-provided helper for this:
+         when the tab already exists and isn't the pane's current tab, it
+         calls its own recursiveShowPane(), which does
+         pane.setIsSplitMaximized(True) up the ENTIRE parent-split chain,
+         a full-screen takeover of the whole desktop (shelf and all other
+         panes included) that's only appropriate for a tool meant to
+         dominate the screen when reopened (e.g. Render Gallery), not a
+         panel meant to sit peacefully alongside the viewport. The panel
+         is also always reachable via the "+" New Pane Tab Type menu of
+         any pane, since it's a registered Python Panel interface — see
          python_panels/kitsu_houdini_plugin.pypanel.
        - "Publish Capture" exports a full-scene H.264 MP4 of the current
          playback range and publishes it to Kitsu as a new revision,
@@ -25,9 +32,30 @@
   <tool name="kitsu_open_panel" label="Kitsu" icon="kitsu_houdini_plugin">
     <helpText>Open the Kitsu panel</helpText>
     <script scriptType="python"><![CDATA[
-import toolutils
+import hou
 
-toolutils.createOrShowPythonPanel(kwargs, "kitsu_houdini_plugin", "Kitsu", 1)
+_INTERFACE_NAME = "kitsu_houdini_plugin"
+pytype = hou.pypanel.interfaces()[_INTERFACE_NAME]
+
+existing = None
+for tab in hou.ui.paneTabs():
+    if tab.type() == hou.paneTabType.PythonPanel and tab.activeInterface() == pytype:
+        existing = tab
+        break
+
+if existing is not None:
+    # Bring the existing tab to the front of its pane -- deliberately NOT
+    # recursiveShowPane()/setIsSplitMaximized(), see the top-of-file note.
+    existing.setIsCurrentTab()
+else:
+    pane = kwargs["pane"]
+    if pane is not None:
+        new_tab = pane.pane().createTab(hou.paneTabType.PythonPanel)
+    else:
+        new_tab = hou.ui.curDesktop().createFloatingPaneTab(hou.paneTabType.PythonPanel)
+    new_tab.setActiveInterface(pytype)
+    if pane is None and new_tab.floatingPanel():
+        new_tab.floatingPanel().setName("Kitsu")
 ]]></script>
   </tool>
 
