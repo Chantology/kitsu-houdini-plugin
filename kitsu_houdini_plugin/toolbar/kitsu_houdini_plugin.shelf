@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Adds a "Kitsu" shelf tab with two buttons — the closest Houdini
+     equivalent of the Maya version's "Kitsu/Zou" menu:
+       - "Kitsu" docks the panel as a pane tab in whichever pane the button
+         was clicked from (or refocuses it if already open elsewhere),
+         the same behavior as SideFX's own shelf-launched panels, via
+         toolutils.createOrShowPythonPanel(..., split_type=1). Deliberately
+         NOT hou.ui.curDesktop().createFloatingPanel(...): that spawns a
+         brand new top-level OS window, which is both not what a Pane Tab
+         Type panel is expected to look like and was observed shoving the
+         whole Houdini main window to a different screen position when
+         invoked (worst over Remote Desktop). The panel is also always
+         reachable via the "+" New Pane Tab Type menu of any pane, since
+         it's a registered Python Panel interface — see
+         python_panels/kitsu_houdini_plugin.pypanel.
+       - "Publish Capture" exports a full-scene H.264 MP4 of the current
+         playback range and publishes it to Kitsu as a new revision,
+         reusing the open panel's already-resolved login/task state. -->
+<shelfDocument>
+  <toolshelf name="kitsu_houdini_plugin" label="Kitsu">
+    <memberTool name="kitsu_open_panel"/>
+    <memberTool name="kitsu_publish_capture"/>
+  </toolshelf>
+
+  <tool name="kitsu_open_panel" label="Kitsu" icon="kitsu_houdini_plugin">
+    <helpText>Open the Kitsu panel</helpText>
+    <script scriptType="python"><![CDATA[
+import toolutils
+
+toolutils.createOrShowPythonPanel(kwargs, "kitsu_houdini_plugin", "Kitsu", 1)
+]]></script>
+  </tool>
+
+  <tool name="kitsu_publish_capture" label="Publish Capture" icon="kitsu_houdini_plugin">
+    <helpText>Export a full-scene video capture and publish it to Kitsu as a new revision</helpText>
+    <script scriptType="python"><![CDATA[
+import hou
+
+from kitsu_houdini_plugin import panel, publish_capture
+
+active_panel = panel.get_active_panel()
+try:
+    publish_capture.ensure_ready(active_panel)
+except publish_capture.PublishCaptureError as exc:
+    hou.ui.displayMessage(str(exc), title="Kitsu")
+else:
+    try:
+        statuses = active_panel.session.all_task_statuses(active_panel.project)
+    except Exception as exc:
+        hou.ui.displayMessage(f"Could not load task statuses: {exc}", title="Kitsu")
+    else:
+        from kitsu_houdini_plugin.capture_dialog import prompt_for_status_and_comment
+
+        prompted = prompt_for_status_and_comment(statuses, parent=hou.qt.mainWindow())
+        if prompted is not None:
+            task_status, comment = prompted
+            try:
+                output_path = publish_capture.run(active_panel, task_status, comment)
+            except publish_capture.PublishCaptureError as exc:
+                hou.ui.displayMessage(str(exc), title="Kitsu")
+            except Exception as exc:
+                hou.ui.displayMessage(f"Capture export failed: {exc}", title="Kitsu")
+            else:
+                hou.ui.displayMessage(
+                    f"Capture published to Kitsu and saved to:\n{output_path}",
+                    title="Kitsu",
+                )
+]]></script>
+  </tool>
+</shelfDocument>

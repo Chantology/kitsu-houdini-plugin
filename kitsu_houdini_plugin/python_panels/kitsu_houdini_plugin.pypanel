@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- This file registers the Kitsu panel as a Python Panel interface, the
+     Houdini equivalent of the dockable panel the Maya version of this
+     plugin adds via MayaQWidgetDockableMixin. It shows up as "Kitsu" in
+     the "+" (New Pane Tab Type) menu of any pane, and can be docked,
+     tabbed, or floated like any other Houdini pane tab. -->
+<pythonPanelDocument>
+  <interface name="kitsu_houdini_plugin" label="Kitsu" icon="kitsu_houdini_plugin">
+    <script><![CDATA[
+from toolutils import safe_reload
+from kitsu_houdini_plugin import panel
+safe_reload(panel)
+
+
+def onCreateInterface():
+    return panel.create_panel()
+
+
+def onDestroyInterface():
+    panel.destroy_panel()
+]]></script>
+    <includeInPaneTabMenu menu_position="200" create_separator="true"/>
+  </interface>
+</pythonPanelDocument>
