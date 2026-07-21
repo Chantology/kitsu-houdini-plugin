@@ -20,6 +20,14 @@
          is also always reachable via the "+" New Pane Tab Type menu of
          any pane, since it's a registered Python Panel interface — see
          python_panels/kitsu_houdini_plugin.pypanel.
+         Note kwargs["pane"] below is ALWAYS None for a shelf-launched
+         tool (per toolutils.activePane()'s own docstring: it's only ever
+         set when a tool is launched from a Tab menu instead), so this
+         cannot just check kwargs["pane"] and fall back to floating, or
+         every shelf click would float. Instead it also tries the pane
+         tab under the cursor, then falls back to the first pane on the
+         current desktop (always present in any real layout) before ever
+         resorting to a floating tab.
        - "Publish Capture" exports a full-scene H.264 MP4 of the current
          playback range and publishes it to Kitsu as a new revision,
          reusing the open panel's already-resolved login/task state. -->
@@ -48,14 +56,32 @@ if existing is not None:
     # recursiveShowPane()/setIsSplitMaximized(), see the top-of-file note.
     existing.setIsCurrentTab()
 else:
-    pane = kwargs["pane"]
-    if pane is not None:
-        new_tab = pane.pane().createTab(hou.paneTabType.PythonPanel)
+    # kwargs["pane"] is always None for a shelf click (see top-of-file
+    # note), so find a real dockable pane ourselves instead of falling
+    # straight to a floating tab.
+    target_pane = None
+
+    source_tab = kwargs.get("pane")
+    if source_tab is not None:
+        target_pane = source_tab.pane()
+
+    if target_pane is None:
+        under_cursor = hou.ui.paneTabUnderCursor()
+        if under_cursor is not None:
+            target_pane = under_cursor.pane()
+
+    if target_pane is None:
+        panes = hou.ui.curDesktop().panes()
+        if panes:
+            target_pane = panes[0]
+
+    if target_pane is not None:
+        new_tab = target_pane.createTab(hou.paneTabType.PythonPanel)
     else:
         new_tab = hou.ui.curDesktop().createFloatingPaneTab(hou.paneTabType.PythonPanel)
+        if new_tab.floatingPanel():
+            new_tab.floatingPanel().setName("Kitsu")
     new_tab.setActiveInterface(pytype)
-    if pane is None and new_tab.floatingPanel():
-        new_tab.floatingPanel().setName("Kitsu")
 ]]></script>
   </tool>
 

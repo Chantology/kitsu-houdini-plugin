@@ -60,6 +60,30 @@ def _drop_stale_gazu_from_cache(vendor_dir):
         del sys.modules[name]
 
 
+_DEFAULT_TIMEOUT_SECONDS = 10
+
+
+def _apply_default_timeout(session, timeout=_DEFAULT_TIMEOUT_SECONDS):
+    """Every gazu/requests call this plugin makes goes through this one
+    `requests.Session` — but neither gazu's own get/post/put helpers nor
+    our own direct `client.session.put(...)` call (see
+    update_comment_checklist) ever pass a `timeout=`, so a stalled
+    connection (dead VPN, a silently-dropped connection, an unresponsive
+    server) blocks Houdini's Qt UI thread indefinitely, since nothing in
+    this plugin backgrounds these calls off the main thread. `Session`'s
+    own get/post/put all route through `.request()` internally, so
+    wrapping it here covers every call path without touching the vendored
+    gazu library itself.
+    """
+    original_request = session.request
+
+    def _request_with_timeout(method, url, **kwargs):
+        kwargs.setdefault("timeout", timeout)
+        return original_request(method, url, **kwargs)
+
+    session.request = _request_with_timeout
+
+
 def normalize_host(url):
     """Turn a user-entered server URL into the `.../api` host gazu expects."""
     url = (url or "").strip().rstrip("/")
@@ -84,6 +108,7 @@ class KitsuSession:
         # OFF, unlike KitsuClient itself) — without it, the refresh token
         # below is only useful at the *next* login, not within this one.
         self.client = self.gazu.client.create_client(self.host, use_refresh_token=True)
+        _apply_default_timeout(self.client.session)
 
     def login(self, email, password):
         exceptions = self.gazu.exception

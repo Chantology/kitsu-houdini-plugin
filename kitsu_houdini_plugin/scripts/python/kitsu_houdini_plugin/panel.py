@@ -16,6 +16,7 @@ itself — no wrapper needed.
 
 import os
 import tempfile
+import threading
 import time
 from datetime import date
 
@@ -30,11 +31,13 @@ from .qt import (
     QListWidget,
     QListWidgetItem,
     QMessageBox,
+    QObject,
     QPixmap,
     QPushButton,
     QScrollArea,
     Qt,
     QSlider,
+    Signal,
     QTextEdit,
     QTimer,
     QVBoxLayout,
@@ -47,6 +50,32 @@ from .collapsible_section import CollapsibleSection
 from .kitsu_api import KitsuConnectionError, KitsuSession
 from .task_detection import TaskDetectionError, TaskTypeMismatch, detect_task
 from .versioning import parse_version_number
+
+
+class _AsyncWorker(QObject):
+    """Runs a single blocking call on a background `threading.Thread` and
+    delivers its result back on the UI thread via a queued Qt signal
+    connection — Qt automatically marshals a signal emitted from another
+    thread onto the receiving QObject's own (here: main/UI) thread, so
+    this is thread-safe by construction, unlike calling Qt widgets or
+    Houdini's `hou` API directly from the background thread (neither is
+    safe off the main thread — see KitsuPanel._run_async).
+    """
+
+    finished = Signal(object)
+    failed = Signal(object)
+
+    def start(self, work_fn):
+        thread = threading.Thread(target=self._run, args=(work_fn,), daemon=True)
+        thread.start()
+
+    def _run(self, work_fn):
+        try:
+            result = work_fn()
+        except Exception as exc:  # forwarded to on_error, whatever it is
+            self.failed.emit(exc)
+        else:
+            self.finished.emit(result)
 
 
 class KitsuPanel(QWidget):
@@ -67,6 +96,8 @@ class KitsuPanel(QWidget):
         self._preview_cache = {}  # preview (revision) id -> local file path
         self._pending_variations = []  # local image paths queued to publish (first = main preview, rest = variations)
         self._last_comment_ids = None  # ids currently rendered in comments_list, for change detection
+        self._async_workers = []  # keeps _AsyncWorker instances alive for the life of their background call
+        self._comment_poll_in_flight = False  # guards against a slow poll overlapping the next 60s tick
 
         self._comment_poll_timer = QTimer(self)
         self._comment_poll_timer.setInterval(60_000)  # 60s: background auto-refresh, no need for finer
@@ -107,9 +138,10 @@ class KitsuPanel(QWidget):
         already filled in — that's the whole point of saving the token
         in the first place, rather than making every session start with
         a manual click. Deferred via QTimer.singleShot(0, ...) so the
-        panel actually finishes appearing before the login's network
-        call blocks the UI thread, instead of the panel only becoming
-        visible once that call finishes.
+        panel actually finishes building and appearing first — the login
+        itself runs on a background thread (see _run_async) and no longer
+        blocks the UI thread either way, but this still lets the panel's
+        own construction finish before anything else touches it.
         """
         if (
             self.server_edit.text().strip()
@@ -117,6 +149,53 @@ class KitsuPanel(QWidget):
             and self.token_edit.text().strip()
         ):
             QTimer.singleShot(0, self._on_login_clicked)
+
+    def _run_async(self, work_fn, on_done, on_error=None):
+        """Run `work_fn` (a plain callable, no arguments) on a background
+        thread so a slow/unresponsive Kitsu server never freezes
+        Houdini's UI thread. `on_done(result)` or `on_error(exc)` runs
+        back on the UI thread once it finishes, via _AsyncWorker's queued
+        Qt signal connection (thread-safe by construction).
+
+        `work_fn` must never touch Qt widgets or call any `hou`/Houdini
+        API — neither is safe off the main thread. It should only call
+        into `self.session`/`gazu` (network) and plain Python. Resolve
+        any Houdini scene state (e.g. houdini_scene.scene_path()) on the
+        UI thread *before* calling this, and pass it in as a plain value.
+
+        If this panel's underlying Qt widget has already been destroyed
+        by the time the background call finishes (e.g. its pane tab was
+        closed mid-request), the callback is silently dropped instead of
+        touching a deleted C++ object.
+        """
+        worker = _AsyncWorker(self)
+        self._async_workers.append(worker)
+
+        def _cleanup():
+            if worker in self._async_workers:
+                self._async_workers.remove(worker)
+
+        def _is_alive():
+            try:
+                self.objectName()  # cheap call that raises once the
+                                    # underlying C++ widget has been deleted
+            except RuntimeError:
+                return False
+            return True
+
+        def _handle_done(result):
+            _cleanup()
+            if _is_alive():
+                on_done(result)
+
+        def _handle_error(exc):
+            _cleanup()
+            if _is_alive() and on_error is not None:
+                on_error(exc)
+
+        worker.finished.connect(_handle_done)
+        worker.failed.connect(_handle_error)
+        worker.start(work_fn)
 
     # ---- UI construction ----
 
@@ -505,38 +584,50 @@ class KitsuPanel(QWidget):
             return
 
         self._set_status("Connecting...")
-        try:
+        self.login_button.setEnabled(False)
+
+        def work():
+            # Runs on a background thread (see _run_async) -- only
+            # self.session/gazu network calls and plain Python here, no
+            # Qt widgets, no hou/Houdini API.
             session = KitsuSession(server_url)
             if token:
                 session.login_with_token(token)
             else:
                 session.login(email, password)
             project = session.project(project_id)
-        except KitsuConnectionError as exc:
-            self._set_status(str(exc), is_error=True)
-            return
-        except Exception as exc:
-            self._set_status(f"Unexpected error: {exc}", is_error=True)
-            return
+            return session, project
 
-        self.session = session
-        self.project = project
-        self.password_edit.clear()
+        def on_done(result):
+            session, project = result
+            self.login_button.setEnabled(True)
+            self.session = session
+            self.project = project
+            self.password_edit.clear()
 
-        if not token:
-            # Just logged in with email/password -- save the refresh token
-            # gazu obtained so the NEXT login can skip the password.
-            refresh_token = session.get_refresh_token()
-            if refresh_token:
-                self.token_edit.setText(refresh_token)
+            if not token:
+                # Just logged in with email/password -- save the refresh
+                # token gazu obtained so the NEXT login can skip the password.
+                refresh_token = session.get_refresh_token()
+                if refresh_token:
+                    self.token_edit.setText(refresh_token)
 
-        self._save_settings()
-        project_name = project.get("name", project_id)
-        self._load_project_header(project)
-        self._load_user_header(session)
-        self._set_status(f"Connected to {session.host} — project '{project_name}'")
-        self._populate_statuses()
-        self._on_refresh_task_clicked()
+            self._save_settings()
+            project_name = project.get("name", project_id)
+            self._load_project_header(project)
+            self._load_user_header(session)
+            self._set_status(f"Connected to {session.host} — project '{project_name}'")
+            self._populate_statuses()
+            self._on_refresh_task_clicked()
+
+        def on_error(exc):
+            self.login_button.setEnabled(True)
+            if isinstance(exc, KitsuConnectionError):
+                self._set_status(str(exc), is_error=True)
+            else:
+                self._set_status(f"Unexpected error: {exc}", is_error=True)
+
+        self._run_async(work, on_done, on_error)
 
     _USER_THUMBNAIL_WIDTH = 80
 
@@ -652,28 +743,43 @@ class KitsuPanel(QWidget):
             return
 
         self._previous_task_id_for_detection = self.task.get("id") if self.task else None
+        # Must resolve on the UI thread -- houdini_scene wraps `hou` API
+        # calls, which aren't safe to make from the background thread
+        # detect_task() below runs on (see _run_async).
         scene_path = houdini_scene.scene_path()
         self._scene_path_for_override = scene_path
         self._hide_task_type_override()
 
-        try:
-            task, breadcrumb, context = detect_task(self.session, self.project, scene_path)
-        except TaskTypeMismatch as exc:
-            self._handle_task_type_mismatch(exc, scene_path)
-            return
-        except TaskDetectionError as exc:
-            self.task = None
-            self.task_breadcrumb = None
-            self.task_context = None
-            self.task_label.setText(str(exc))
-            self.task_status_label.setVisible(False)
-            self.task_due_date_label.setVisible(False)
-            self.task_time_spent_label.setVisible(False)
-            self.time_entry_group.setVisible(False)
-            self._time_tracking_active = False
-            return
+        session = self.session
+        project = self.project
 
-        self._apply_resolved_task(task, breadcrumb, context)
+        def work():
+            return detect_task(session, project, scene_path)
+
+        def on_done(result):
+            task, breadcrumb, context = result
+            self._apply_resolved_task(task, breadcrumb, context)
+
+        def on_error(exc):
+            # TaskTypeMismatch is a TaskDetectionError subclass -- checked
+            # first, same order as the try/except this replaced.
+            if isinstance(exc, TaskTypeMismatch):
+                self._handle_task_type_mismatch(exc, scene_path)
+                return
+            if isinstance(exc, TaskDetectionError):
+                self.task = None
+                self.task_breadcrumb = None
+                self.task_context = None
+                self.task_label.setText(str(exc))
+                self.task_status_label.setVisible(False)
+                self.task_due_date_label.setVisible(False)
+                self.task_time_spent_label.setVisible(False)
+                self.time_entry_group.setVisible(False)
+                self._time_tracking_active = False
+                return
+            self._set_status(f"Unexpected error detecting task: {exc}", is_error=True)
+
+        self._run_async(work, on_done, on_error)
 
     def _apply_resolved_task(self, task, breadcrumb, context):
         """Finish populating the task group for a resolved task, whether
@@ -914,17 +1020,34 @@ class KitsuPanel(QWidget):
         # silent on failure (a transient network hiccup shouldn't nag the
         # user every 60s) and a no-op entirely when nothing actually
         # changed, so it never disrupts a comment you have selected/open.
+        # Runs on a background thread (see _run_async): this fires every
+        # 60s for as long as the panel is open, so a slow/stalled request
+        # must never block Houdini's UI thread while it's in flight.
         if not (self.session and self.task):
             return
-        try:
-            comments = self.session.all_comments_for_task(self.task)
-        except Exception:
+        if self._comment_poll_in_flight:
+            # A previous tick's request is still running (slower than the
+            # 60s interval) -- skip rather than stack another one on top.
             return
 
-        new_ids = [comment.get("id") for comment in comments]
-        if new_ids == self._last_comment_ids:
-            return
-        self._render_comments(comments, preserve_selection=True)
+        session = self.session
+        task = self.task
+        self._comment_poll_in_flight = True
+
+        def work():
+            return session.all_comments_for_task(task)
+
+        def on_done(comments):
+            self._comment_poll_in_flight = False
+            new_ids = [comment.get("id") for comment in comments]
+            if new_ids == self._last_comment_ids:
+                return
+            self._render_comments(comments, preserve_selection=True)
+
+        def on_error(_exc):
+            self._comment_poll_in_flight = False  # silent on failure, same as before
+
+        self._run_async(work, on_done, on_error)
 
     def _resolve_comment_revision(self, comment):
         # A comment has a preview attached exactly when it was posted
@@ -1522,6 +1645,16 @@ def create_panel():
 def destroy_panel():
     """Called by the Python Panel interface's `onDestroyInterface`."""
     global _panel
+    if _panel is not None:
+        # Explicit, deterministic stop rather than relying on Qt/Python
+        # object teardown timing -- each timer's timeout signal is
+        # connected to a bound method of the panel itself, a reference
+        # cycle that isn't guaranteed to be collected the instant this
+        # function drops the module-level reference below. Left running,
+        # either timer would keep firing (and, for the comment poll,
+        # keep making network calls) even after the tab is closed.
+        _panel._comment_poll_timer.stop()
+        _panel._time_tracking_timer.stop()
     _panel = None
 
 

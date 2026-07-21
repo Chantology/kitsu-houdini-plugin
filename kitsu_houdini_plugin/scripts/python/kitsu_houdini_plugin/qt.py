@@ -8,7 +8,7 @@ classes from here instead, so the rest of the code never needs to care
 which binding is actually loaded.
 """
 
-from hutil.PySide.QtCore import QRectF, QSettings, Qt, QTimer, Signal
+from hutil.PySide.QtCore import QObject, QRectF, QSettings, Qt, QTimer, Signal
 from hutil.PySide.QtGui import (
     QBrush,
     QColor,
