@@ -23,6 +23,7 @@ from datetime import date
 from .qt import (
     QCheckBox,
     QComboBox,
+    QEvent,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -84,6 +85,7 @@ class KitsuPanel(QWidget):
 
         self.session = None
         self.project = None
+        self.current_user = None  # the logged-in Kitsu account (see _load_user_header)
         self.task = None
         self.task_breadcrumb = None  # resolved entity names, top-down (see task_detection.detect_task)
         self.task_context = None  # "asset" or "shot"
@@ -117,7 +119,23 @@ class KitsuPanel(QWidget):
         self._time_tracking_timer.setInterval(30_000)  # 30s: plenty for minute-level display
         self._time_tracking_timer.timeout.connect(self._on_time_tracking_tick)
 
-        layout = QVBoxLayout(self)
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+
+        # The panel is a floating, freely-resized window now rather than a
+        # docked pane tab, so its content can easily end up taller than
+        # whatever height an artist leaves it at -- wrap everything in a
+        # scroll area (vertical scrollbar only, appearing on the right
+        # exactly when content overflows) instead of letting it just clip.
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QScrollArea.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        outer_layout.addWidget(scroll_area)
+
+        content = QWidget()
+        layout = QVBoxLayout(content)
 
         self.status_label = QLabel("Not connected")
         self.status_label.setWordWrap(True)
@@ -129,8 +147,25 @@ class KitsuPanel(QWidget):
         layout.addWidget(self._build_section("publish", "Publish", self._build_publish_group()))
         layout.addStretch(1)
 
+        scroll_area.setWidget(content)
+
         self._load_settings()
         self._maybe_auto_login()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        # Each shelf click now opens an independent floating window (see
+        # kitsu_houdini_plugin.shelf), so more than one can be open at
+        # once -- usually because an artist forgot one was already open,
+        # not because they actually want two. This tracks which one the
+        # artist actually looked at most recently, so get_active_panel()
+        # (used by "Publish Capture") can act on the one carrying their
+        # real login/task state instead of an arbitrary one. Deliberately
+        # keyed on ActivationChange rather than "which one currently has
+        # focus": by the time a shelf action runs, focus is on Houdini's
+        # main window (where the shelf lives), not on any Kitsu window.
+        if event.type() == QEvent.ActivationChange and self.isActiveWindow():
+            _mark_most_recently_focused(self)
 
     def _maybe_auto_login(self):
         """Log in automatically if a server URL, project ID, and a saved
@@ -433,7 +468,13 @@ class KitsuPanel(QWidget):
             QMessageBox.warning(self, "Kitsu", "Detect a task before logging time.")
             return
 
-        minutes = self.time_slider.value()
+        # The slider itself only snaps to _TIME_SLIDER_STEP_MINUTES when
+        # dragged by hand -- the auto-advance timer sets it minute-by-minute
+        # (see _on_time_tracking_tick), so a Log Time click mid-tick could
+        # otherwise submit an odd value like 80, which Kitsu's web
+        # timesheet then shows as a repeating decimal ("1.3333333h").
+        step = self._TIME_SLIDER_STEP_MINUTES
+        minutes = round(self.time_slider.value() / step) * step
         try:
             user = self.session.current_user()
         except Exception as exc:
@@ -635,13 +676,17 @@ class KitsuPanel(QWidget):
         # Fetching the logged-in user's own name/avatar is a nice-to-have,
         # not something a login should fail over — any problem here just
         # leaves the greeting hidden, same as a project with no thumbnail.
+        # It doubles as the one place the logged-in account is resolved:
+        # the timesheet needs the person id to read back today's total.
         try:
             user = session.current_user()
         except Exception:
+            self.current_user = None
             self.user_welcome_label.setVisible(False)
             self.user_thumbnail_label.setVisible(False)
             return
 
+        self.current_user = user
         display_name = user.get("full_name") or user.get("email") or "there"
         self.user_welcome_label.setText(f"Welcome, {display_name}")
         self.user_welcome_label.setVisible(True)
@@ -941,14 +986,25 @@ class KitsuPanel(QWidget):
 
     def _update_time_spent_today(self, task, restart_time_tracking=True):
         today = date.today().isoformat()
+        person_id = (self.current_user or {}).get("id")
+        if not person_id:
+            # Without knowing which account we are, there's no way to tell
+            # this user's own logged time apart from a colleague's on the
+            # same task — better to say so than to show someone else's.
+            self.task_time_spent_label.setText(
+                "Time logged today: unknown (the logged-in account could "
+                "not be resolved)"
+            )
+            self.task_time_spent_label.setVisible(True)
+            return
+
         try:
-            info = self.session.get_time_spent_today(task, today)
+            minutes = self.session.get_time_spent_today(task, today, person_id)
         except Exception as exc:
             self.task_time_spent_label.setText(f"Time logged today: could not load ({exc})")
             self.task_time_spent_label.setVisible(True)
             return
 
-        minutes = (info or {}).get("duration") or 0
         self.task_time_spent_label.setText(f"Time logged today: {self._format_minutes(minutes)}")
         self.task_time_spent_label.setVisible(True)
 
@@ -1627,51 +1683,78 @@ class KitsuPanel(QWidget):
         self._load_comments()
 
 
-_panel = None
+# Every open KitsuPanel, oldest to most-recently-focused (see
+# KitsuPanel.changeEvent) -- each shelf click opens its own independent
+# floating window (see kitsu_houdini_plugin.shelf), so more than one of
+# these can be alive at once.
+_panels = []
+
+
+def _mark_most_recently_focused(panel_instance):
+    if panel_instance in _panels:
+        _panels.remove(panel_instance)
+        _panels.append(panel_instance)
 
 
 def create_panel():
-    """Called by the Python Panel interface's `onCreateInterface`.
+    """Called by the Python Panel interface's `onCreateInterface`, once
+    per Kitsu window opened.
 
     Returns the panel widget for Houdini to host in its pane tab — Python
     Panel pane tabs are dockable by default, so unlike Maya there's no
     separate "show/dock" step.
     """
-    global _panel
-    _panel = KitsuPanel()
-    return _panel
+    panel_instance = KitsuPanel()
+    _panels.append(panel_instance)
+    return panel_instance
 
 
-def destroy_panel():
-    """Called by the Python Panel interface's `onDestroyInterface`."""
-    global _panel
-    if _panel is not None:
-        # Explicit, deterministic stop rather than relying on Qt/Python
-        # object teardown timing -- each timer's timeout signal is
-        # connected to a bound method of the panel itself, a reference
-        # cycle that isn't guaranteed to be collected the instant this
-        # function drops the module-level reference below. Left running,
-        # either timer would keep firing (and, for the comment poll,
-        # keep making network calls) even after the tab is closed.
-        _panel._comment_poll_timer.stop()
-        _panel._time_tracking_timer.stop()
-    _panel = None
+def destroy_panel(panel_instance):
+    """Called by the Python Panel interface's `onDestroyInterface` with
+    the exact instance THAT tab created (see the .pypanel script's
+    `_this_panel` closure) -- other still-open Kitsu windows must be left
+    untouched.
+    """
+    if panel_instance is None:
+        return
+    # Explicit, deterministic stop rather than relying on Qt/Python
+    # object teardown timing -- each timer's timeout signal is connected
+    # to a bound method of the panel itself, a reference cycle that isn't
+    # guaranteed to be collected the instant this function drops its
+    # reference below. Left running, either timer would keep firing (and,
+    # for the comment poll, keep making network calls) even after the tab
+    # is closed.
+    panel_instance._comment_poll_timer.stop()
+    panel_instance._time_tracking_timer.stop()
+    if panel_instance in _panels:
+        _panels.remove(panel_instance)
 
 
 def get_active_panel():
-    """Return the current KitsuPanel instance if create_panel() has made
-    one and its underlying Qt widget is still alive, else None.
+    """Return whichever open KitsuPanel the artist actually looked at
+    most recently, or None if none are open.
 
     Used by shelf actions (e.g. Publish Capture) that need the panel's
     already-resolved login/task state without opening or touching the UI
     themselves — they should tell the user to open the panel first rather
     than creating one behind their back.
+
+    With multiple Kitsu windows possibly open at once, "most recently
+    focused" (tracked via KitsuPanel.changeEvent) is what actually
+    reflects which one the artist has been using — not creation order,
+    and not "currently focused" (by the time a shelf action runs, focus
+    is on Houdini's main window, not any Kitsu window). Falls back to the
+    most recently created if none has ever been focused yet (e.g. Publish
+    Capture invoked immediately after opening a fresh panel).
     """
-    if _panel is None:
-        return None
-    try:
-        _panel.objectName()  # cheap call that raises once the underlying
-                              # C++ widget has been deleted
-    except RuntimeError:
-        return None
-    return _panel
+    global _panels
+    alive = []
+    for candidate in _panels:
+        try:
+            candidate.objectName()  # cheap call that raises once the
+                                     # underlying C++ widget has been deleted
+        except RuntimeError:
+            continue
+        alive.append(candidate)
+    _panels = alive
+    return alive[-1] if alive else None

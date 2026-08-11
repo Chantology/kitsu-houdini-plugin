@@ -31,10 +31,13 @@ def save(values):
 
 def load_section_collapsed(name):
     settings = QSettings(_ORG, _APP)
+    # Defaults to collapsed (True) so a floating window starts small and
+    # each artist opts into keeping a given section open, rather than
+    # every section starting expanded and eating window space up front.
     # QSettings round-trips bools as the strings "true"/"false" on some
     # platforms; PySide has no `type=` keyword like PyQt5, so normalize
     # explicitly.
-    value = settings.value(f"section_collapsed_{name}", False)
+    value = settings.value(f"section_collapsed_{name}", True)
     if isinstance(value, str):
         return value.lower() == "true"
     return bool(value)

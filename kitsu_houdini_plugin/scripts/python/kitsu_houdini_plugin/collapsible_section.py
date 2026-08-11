@@ -1,7 +1,7 @@
 """A simple collapsible section: a clickable title header that shows/hides
 a content widget beneath it, used to let the Kitsu panel's Connection/Task/
-Feedback/Publish groups shrink out of the way so the panel takes up less
-room when docked next to the Parameter Editor, Network Editor, etc.
+Feedback/Publish groups shrink out of the way so the panel's floating
+window can stay small on screen.
 """
 
 from .qt import Qt, QSizePolicy, QToolButton, QVBoxLayout, QWidget, Signal

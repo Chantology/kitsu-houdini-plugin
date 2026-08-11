@@ -11,13 +11,22 @@ from toolutils import safe_reload
 from kitsu_houdini_plugin import panel
 safe_reload(panel)
 
+# Each Python Panel tab gets its own execution of this script, so this
+# module-level name is per-tab, not shared across multiple open Kitsu
+# windows -- see panel.create_panel()/destroy_panel() for why that
+# matters (each tab must stop only ITS OWN panel's timers, not whichever
+# one happens to be the module's last-created one).
+_this_panel = None
+
 
 def onCreateInterface():
-    return panel.create_panel()
+    global _this_panel
+    _this_panel = panel.create_panel()
+    return _this_panel
 
 
 def onDestroyInterface():
-    panel.destroy_panel()
+    panel.destroy_panel(_this_panel)
 ]]></script>
     <includeInPaneTabMenu menu_position="200" create_separator="true"/>
   </interface>
