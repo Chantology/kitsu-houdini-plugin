@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Houdini
+*.hip~
+*.hiplc~
+*.hipnc~
+backup/
+houdini_temp/
+*.rat
+*.bgeo.sc.tmp
+
+# Claude Code's per-machine local settings — local file paths and
+# tool-permission state specific to one machine, not project config.
+.claude/
+
+# Studio deployment (kept out of the public repo: contains local paths
+# and internal project names). Previously enforced only via this clone's
+# .git/info/exclude, which is per-clone and never shared — so a fresh
+# clone on another machine had no protection at all.
+deploy_paths.txt
+deploy_windows.cmd
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+*.bak
+*.orig
+.DS_Store
+Thumbs.db
+desktop.ini

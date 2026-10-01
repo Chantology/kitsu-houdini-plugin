@@ -26,6 +26,7 @@ from .qt import (
     QEvent,
     QFileDialog,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -48,7 +49,13 @@ from .qt import (
 from . import houdini_scene, settings, video_annotations
 from .annotations import picture_annotation_objects, render_annotations
 from .collapsible_section import CollapsibleSection
-from .kitsu_api import KitsuConnectionError, KitsuSession
+from .kitsu_api import (
+    KitsuConnectionError,
+    KitsuSession,
+    TwoFactorRequired,
+    WrongTwoFactorCode,
+    two_factor_prompt,
+)
 from .task_detection import TaskDetectionError, TaskTypeMismatch, detect_task
 from .versioning import parse_version_number
 
@@ -99,6 +106,7 @@ class KitsuPanel(QWidget):
         self._pending_variations = []  # local image paths queued to publish (first = main preview, rest = variations)
         self._last_comment_ids = None  # ids currently rendered in comments_list, for change detection
         self._async_workers = []  # keeps _AsyncWorker instances alive for the life of their background call
+        self._two_factor_methods = []  # set once a login raises TwoFactorRequired; empty = 2FA section hidden
         self._comment_poll_in_flight = False  # guards against a slow poll overlapping the next 60s tick
 
         self._comment_poll_timer = QTimer(self)
@@ -122,15 +130,24 @@ class KitsuPanel(QWidget):
         outer_layout = QVBoxLayout(self)
         outer_layout.setContentsMargins(0, 0, 0, 0)
 
-        # The panel is a floating, freely-resized window now rather than a
-        # docked pane tab, so its content can easily end up taller than
-        # whatever height an artist leaves it at -- wrap everything in a
-        # scroll area (vertical scrollbar only, appearing on the right
-        # exactly when content overflows) instead of letting it just clip.
+        # The panel opens as a small floating window the artist resizes
+        # freely (and can drag into a pane if they want), so its stacked
+        # sections can easily end up taller or narrower than whatever it
+        # ends up in -- wrap everything in a scroll area (scrollbars
+        # appearing only when content overflows) instead of letting it
+        # just clip.
+        # Both axes are deliberately ScrollBarAsNeeded. Turning the
+        # horizontal one fully off looks tidier, but a scroll area that
+        # cannot scroll an axis has to be at least as large as its
+        # content's minimum along that axis -- so the panel would
+        # advertise a hard minimum width to Houdini's pane host, which
+        # both fights narrow docked panes and is the kind of rigid cached
+        # size suspected of contributing to the main-window relayout
+        # glitch noted in the shelf tool's comments.
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_area.setFrameShape(QScrollArea.NoFrame)
-        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         outer_layout.addWidget(scroll_area)
 
@@ -154,11 +171,12 @@ class KitsuPanel(QWidget):
 
     def changeEvent(self, event):
         super().changeEvent(event)
-        # Each shelf click now opens an independent floating window (see
-        # kitsu_houdini_plugin.shelf), so more than one can be open at
-        # once -- usually because an artist forgot one was already open,
-        # not because they actually want two. This tracks which one the
-        # artist actually looked at most recently, so get_active_panel()
+        # More than one Kitsu panel can be open at once: the shelf button
+        # re-focuses an already-visible one rather than duplicating it
+        # (see kitsu_houdini_plugin.shelf), but a second can still arrive
+        # via any pane's "+" New Pane Tab Type menu or a second desktop.
+        # This tracks which one the artist actually looked at most
+        # recently, so get_active_panel()
         # (used by "Publish Capture") can act on the one carrying their
         # real login/task state instead of an arbitrary one. Deliberately
         # keyed on ActivationChange rather than "which one currently has
@@ -289,11 +307,85 @@ class KitsuPanel(QWidget):
         self.user_thumbnail_label.setVisible(False)
         form.addRow(self.user_thumbnail_label)
 
+        form.addRow(self._build_two_factor_group())
+
         self.login_button = QPushButton("Login")
         self.login_button.clicked.connect(self._on_login_clicked)
         form.addRow(self.login_button)
 
         return group
+
+    _TWO_FACTOR_LABELS = {
+        "totp": "Authenticator App",
+        "email_otp": "Email Code",
+        "recovery_code": "Recovery Code",
+    }
+
+    def _build_two_factor_group(self):
+        """The "Two-Factor Authentication" box: hidden until a login
+        raises TwoFactorRequired (see _show_two_factor), hidden again once
+        a login succeeds or fails for any other reason."""
+        self.two_factor_group = QGroupBox("Two-Factor Authentication")
+        form = QFormLayout(self.two_factor_group)
+
+        self.two_factor_method_combo = QComboBox()
+        # `activated` (user picks only), not `currentIndexChanged`, so
+        # repopulating the combo in _show_two_factor doesn't overwrite the
+        # TwoFactorRequired status message.
+        self.two_factor_method_combo.activated.connect(self._on_two_factor_method_changed)
+        self.two_factor_method_label = QLabel("Method")
+        form.addRow(self.two_factor_method_label, self.two_factor_method_combo)
+
+        self.two_factor_code_edit = QLineEdit()
+        self.two_factor_code_edit.setPlaceholderText("Two-factor code")
+        self.two_factor_code_edit.returnPressed.connect(self._on_login_clicked)
+        form.addRow("Code", self.two_factor_code_edit)
+
+        self.send_code_button = QPushButton("Send Code")
+        self.send_code_button.setToolTip("Email a new two-factor code to this account")
+        self.send_code_button.clicked.connect(self._on_send_code_clicked)
+        form.addRow(self.send_code_button)
+
+        self.two_factor_group.setVisible(False)
+        return self.two_factor_group
+
+    def _current_two_factor_method(self):
+        return self.two_factor_method_combo.currentData()
+
+    def _show_two_factor(self, methods, preferred):
+        self._two_factor_methods = list(methods)
+        self.two_factor_method_combo.clear()
+        for method in self._two_factor_methods:
+            self.two_factor_method_combo.addItem(self._TWO_FACTOR_LABELS.get(method, method), method)
+        index = self.two_factor_method_combo.findData(preferred)
+        self.two_factor_method_combo.setCurrentIndex(max(index, 0))
+        multiple = len(self._two_factor_methods) > 1
+        self.two_factor_method_label.setVisible(multiple)
+        self.two_factor_method_combo.setVisible(multiple)
+        self.two_factor_code_edit.clear()
+        self._update_send_code_visibility()
+        self.two_factor_group.setVisible(True)
+        self.login_button.setText("Verify & Log In")
+        self.two_factor_code_edit.setFocus()
+
+    def _hide_two_factor(self):
+        self._two_factor_methods = []
+        self.two_factor_code_edit.clear()
+        self.two_factor_group.setVisible(False)
+        self.login_button.setText("Login")
+
+    def _update_send_code_visibility(self):
+        self.send_code_button.setVisible(self._current_two_factor_method() == "email_otp")
+
+    def _on_two_factor_method_changed(self, _index):
+        self._update_send_code_visibility()
+        method = self._current_two_factor_method()
+        if method == "email_otp":
+            # Deliberately not auto-sending on switch — the artist may just
+            # be browsing methods; Send Code is one click away.
+            self._set_status("Click Send Code, then enter the emailed code and log in again.")
+        else:
+            self._set_status(two_factor_prompt(method))
 
     _PROJECT_THUMBNAIL_WIDTH = 120
 
@@ -624,6 +716,17 @@ class KitsuPanel(QWidget):
             QMessageBox.warning(self, "Kitsu", "Please enter an email/password or an API token.")
             return
 
+        # Only sent once the server has asked for it (TwoFactorRequired
+        # below) -- a token login never sends a code.
+        two_factor_method = None
+        two_factor_code = None
+        if self._two_factor_methods and not token:
+            two_factor_method = self._current_two_factor_method()
+            two_factor_code = self.two_factor_code_edit.text().strip()
+            if not two_factor_code:
+                self._set_status("Enter your two-factor code.", is_error=True)
+                return
+
         self._set_status("Connecting...")
         self.login_button.setEnabled(False)
 
@@ -635,7 +738,7 @@ class KitsuPanel(QWidget):
             if token:
                 session.login_with_token(token)
             else:
-                session.login(email, password)
+                session.login(email, password, two_factor_method, two_factor_code)
             project = session.project(project_id)
             return session, project
 
@@ -645,6 +748,7 @@ class KitsuPanel(QWidget):
             self.session = session
             self.project = project
             self.password_edit.clear()
+            self._hide_two_factor()
 
             if not token:
                 # Just logged in with email/password -- save the refresh
@@ -663,6 +767,42 @@ class KitsuPanel(QWidget):
 
         def on_error(exc):
             self.login_button.setEnabled(True)
+            if isinstance(exc, TwoFactorRequired):
+                # Password was right -- reveal the code field and ask again.
+                self._show_two_factor(exc.methods, exc.preferred)
+                self._set_status(str(exc))
+            elif isinstance(exc, WrongTwoFactorCode):
+                self.two_factor_code_edit.clear()
+                self._set_status(str(exc), is_error=True)
+            else:
+                self._hide_two_factor()
+                if isinstance(exc, KitsuConnectionError):
+                    self._set_status(str(exc), is_error=True)
+                else:
+                    self._set_status(f"Unexpected error: {exc}", is_error=True)
+
+        self._run_async(work, on_done, on_error)
+
+    def _on_send_code_clicked(self):
+        server_url = self.server_edit.text().strip()
+        email = self.email_edit.text().strip()
+        if not (server_url and email):
+            QMessageBox.warning(self, "Kitsu", "Please fill in the server URL and email first.")
+            return
+
+        self._set_status("Sending code...")
+        self.send_code_button.setEnabled(False)
+
+        def work():
+            # Background thread (see _run_async) -- network only.
+            KitsuSession(server_url).send_email_code(email)
+
+        def on_done(_result):
+            self.send_code_button.setEnabled(True)
+            self._set_status(two_factor_prompt("email_otp"))
+
+        def on_error(exc):
+            self.send_code_button.setEnabled(True)
             if isinstance(exc, KitsuConnectionError):
                 self._set_status(str(exc), is_error=True)
             else:
@@ -1684,9 +1824,10 @@ class KitsuPanel(QWidget):
 
 
 # Every open KitsuPanel, oldest to most-recently-focused (see
-# KitsuPanel.changeEvent) -- each shelf click opens its own independent
-# floating window (see kitsu_houdini_plugin.shelf), so more than one of
-# these can be alive at once.
+# KitsuPanel.changeEvent) -- more than one of these can be alive at once
+# (any pane's "+" New Pane Tab Type menu, or a second desktop; the shelf
+# button itself re-focuses instead of duplicating, see
+# kitsu_houdini_plugin.shelf).
 _panels = []
 
 

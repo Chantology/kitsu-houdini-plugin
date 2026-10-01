@@ -157,6 +157,28 @@ points at what to remove from your Python environment.
 
 ## Using the plugin
 
+The **Kitsu** button on the **Kitsu** shelf tab opens the panel as a small
+floating window you can drag wherever suits your layout, including onto a
+second monitor. Clicking the button again brings that window back to the
+front rather than opening a duplicate.
+
+To **dock** it as a pane tab, drag the little **Kitsu** tab in the
+window's own tab strip onto any pane — dragging the window's OS title bar
+only moves the window around, it doesn't dock anything. To **undock** it
+again afterwards, open that pane's **pane menu** and choose **Tear Off
+Pane Tab**, which removes it from the pane and puts it back in its own
+floating window. Houdini has no drag-out-into-empty-space gesture for
+this, so the menu (or a hotkey) is the way — dropping a tab anywhere
+other than another pane does nothing. **Tear Off Pane Tab Copy** is the
+neighbouring variant that leaves the docked tab where it is and opens a
+copy in a floating window instead. Both are ordinary hotkey actions
+(`tearoff` and `clone`), so they can be bound to keys if you move the
+panel around a lot.
+
+The panel is also always available from the **+** ("New Pane Tab Type")
+button on any pane's tab strip, under **Kitsu** — handy if you'd rather
+dock it directly than open it floating first.
+
 Each section (Connection, Task, Feedback, Publish) has a clickable title
 that collapses/expands it — handy for reclaiming vertical space once you
 don't need, say, the Connection or Task section visible anymore.

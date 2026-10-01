@@ -1,28 +1,84 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- Adds a "Kitsu" shelf tab with two buttons — the closest Houdini
      equivalent of the Maya version's "Kitsu/Zou" menu:
-       - "Kitsu" always opens a new floating window, rather than docking as
-         a pane tab. An earlier version tried to dock into whichever pane
-         made sense (cursor position, first pane on the desktop, reusing an
-         existing tab elsewhere) but that heuristic proved unpredictable in
-         practice once tested across artists with wildly different pane
-         layouts — sometimes docking somewhere awkward, sometimes silently
-         reusing a tab the artist could no longer see. A floating window
-         sidesteps all of that: the artist drags it wherever suits their
-         own layout, and every click is guaranteed to produce a visible
-         result. This intentionally means repeat clicks open multiple
-         independent Kitsu windows rather than refocusing one — see
-         panel.get_active_panel()'s docstring for how that interacts with
-         "Publish Capture" below.
-         Uses hou.ui.curDesktop().createFloatingPaneTab(...), NOT
-         hou.ui.curDesktop().createFloatingPanel(...): the latter spawns a
-         brand new top-level OS window and was observed shoving the whole
+       - "Kitsu" opens the panel as a small floating window the artist can
+         drag wherever suits them, INCLUDING onto a pane to dock it as a
+         tab if they want. This is a deliberate product decision from
+         artist feedback, not a technical fallback: Houdini users have
+         wildly different pane layouts, so there is no pane this tool can
+         pick that is the right answer for everyone. Earlier versions
+         tried to dock into a "sensible" pane (the pane under the cursor,
+         the first pane on the desktop, an existing tab elsewhere) and it
+         went wrong in both directions: docking somewhere unwanted for
+         some artists, and, when the chosen pane happened to be collapsed
+         on a split or on a hip file's other saved desktop, creating a
+         perfectly real tab that nobody could see, which is
+         indistinguishable from the button doing nothing at all.
+         Uses createFloatingPanel(), NOT createFloatingPaneTab(). This
+         matters and is easy to get wrong: per the HOM docs,
+         createFloatingPaneTab() builds a deliberately locked-down window
+         where "the graphical interface to add more tabs or split the pane
+         inside the panel is not exposed" and which "does not contain any
+         panes" (hou.PaneTab.pane() returns None on it). That window has
+         no tab strip at all, so there is physically nothing to grab to
+         drag it onto a pane, and no amount of showPaneTabs() can add one.
+         createFloatingPanel() by contrast "is not locked down, and the
+         user can add more pane tabs and split the panes", so its tab
+         strip is a real, draggable handle. Its pane also gets
+         showPaneTabs(True) below, since Houdini can otherwise hide that
+         strip when only one tab is in it, which would leave the artist
+         with the same "nothing to grab" problem for a different reason.
+         Note dragging the window's OS title bar only moves the window; it
+         is the little "Kitsu" tab that docks it.
+         CAVEAT worth keeping in mind if a layout bug is ever reported
+         against this: an early version of this plugin used
+         createFloatingPanel() and it "was observed shoving the whole
          Houdini main window to a different screen position when invoked
-         (worst over Remote Desktop). createFloatingPaneTab() still floats
-         freely as its own window but doesn't have that problem. The panel
-         is also always reachable via the "+" New Pane Tab Type menu of
-         any pane, since it's a registered Python Panel interface — see
-         python_panels/kitsu_houdini_plugin.pypanel.
+         (worst over Remote Desktop)". That call passed no position or
+         size at all and let Houdini choose, which is exactly the case the
+         explicit screen-aware geometry below is meant to avoid, so this
+         is believed (not proven) to be addressed. hou.Desktop's
+         "immediate" argument, documented as helping "setting the window
+         position correctly", is the next lever to try if it recurs.
+         Clicking again brings an already-open, reachable panel to the
+         front rather than piling up duplicates. "Reachable" is guarded
+         the same way the old docking code had to be (pane exists, on the
+         current desktop, not collapsed on a split): re-focusing an
+         unreachable tab silently succeeds while looking, again, exactly
+         like a dead button. A panel can still legitimately be opened more
+         than once via any pane's "+" New Pane Tab Type menu, which is why
+         panel.py tracks a list rather than a single instance.
+         Two further details are copied from SideFX's own floating Python
+         Panel code ($HH/python3.11libs/scenegraphlayers/panelutils.py,
+         openPanelForNode()), both verified against that source:
+           * the interface name goes into the creation call itself rather
+             than a separate setActiveInterface() afterward. Both are
+             window/OpenGL-context operations (listed in _ui_thread_funcs
+             in $HH/python3.11libs/houpythonportion/ui.py) and doing two
+             back to back is the leading suspect for the reported glitch
+             where Houdini's MAIN window kept drawing from stale layout
+             geometry with its whole top chrome row missing (the menu bar,
+             which on Windows also carries minimize/maximize/close) until
+             any resize forced a relayout. Passing the name up front does
+             it in one operation, and additionally suppresses the generic
+             Python Panel toolbar a default-constructed one comes with.
+           * an explicit position and size on whichever screen the cursor
+             is on. Houdini's default placement can land the window on a
+             different monitor, and on a mixed-DPI Windows setup that
+             forces a UI-scale recompute of the entire interface.
+         The work is wrapped in hdefereval.executeDeferred() so the new
+         window and its GL context are built after Houdini finishes
+         dispatching this shelf click rather than partway through it. Note
+         the originally documented reason for this (that the
+         _ui_thread_funcs decorator itself needs it) does NOT hold up:
+         that decorator (_runInUIThread) is a plain same-thread
+         passthrough when already called from the main thread, which a
+         shelf click always is, and panelutils.openPanelForNode() calls
+         these functions fully synchronously. It is kept as a low-cost
+         precaution against Qt reentrancy, creating and activating a
+         top-level window from inside a toolbar button's own event
+         dispatch being a plausible (if unproven) route to the
+         stale-relayout glitch above.
        - "Publish Capture" exports a full-scene H.264 MP4 of the current
          playback range and publishes it to Kitsu as a new revision,
          reusing the open panel's already-resolved login/task state. -->
@@ -38,25 +94,151 @@
 import hou
 import traceback
 
-# Wrapped in try/except from the very top: a shelf tool exception is
-# reported by Houdini only as a small icon in the status bar, not a
-# dialog, so a failure anywhere in here previously looked identical to
-# the button doing nothing at all.
-try:
-    _INTERFACE_NAME = "kitsu_houdini_plugin"
-    pytype = hou.pypanel.interfaces()[_INTERFACE_NAME]
+_INTERFACE_NAME = "kitsu_houdini_plugin"
+# Narrow and tall, matching the panel's own stacked-sections content.
+# Clamped to the screen in _floating_geometry() below.
+_DEFAULT_WIDTH = 460
+_DEFAULT_HEIGHT = 640
 
-    new_tab = hou.ui.curDesktop().createFloatingPaneTab(hou.paneTabType.PythonPanel)
-    if new_tab.floatingPanel():
-        new_tab.floatingPanel().setName("Kitsu")
-    new_tab.setActiveInterface(pytype)
-except Exception as exc:
-    hou.ui.displayMessage(
-        f"Could not open the Kitsu panel: {exc}",
-        severity=hou.severityType.Error,
-        title="Kitsu",
-        details=traceback.format_exc(),
-    )
+
+def _floating_geometry():
+    """Return (position, size) for a new floating window on whichever
+    screen the cursor is on, or (None, None) to let Houdini place it
+    itself. See the top-of-file note on why the default placement is
+    worth avoiding where possible."""
+    try:
+        import uiutils
+        from hutil.Qt import QtGui
+
+        mouse_pos = QtGui.QCursor.pos()
+        screen_rect = uiutils.getScreenRect(mouse_pos)
+        # fitWindowToScreen() only ever MOVES the rect, never shrinks it
+        # (its own docstring assumes the size already fits), so clamp first.
+        width = min(_DEFAULT_WIDTH, screen_rect.width())
+        height = min(_DEFAULT_HEIGHT, screen_rect.height())
+        window_rect = uiutils.fitWindowToScreen(mouse_pos, width, height, True)
+
+        # Houdini window positions are bottom-up while Qt's rects are
+        # top-down: same flip SideFX's own floating Python Panels apply.
+        position = [window_rect.left(), screen_rect.height() - window_rect.bottom()]
+        size = [window_rect.width(), window_rect.height()]
+        return position, size
+    except Exception:
+        # Placement is a nicety, not worth failing the whole action over
+        # (e.g. QGuiApplication.screenAt() returns None for a cursor that
+        # isn't on any screen).
+        return None, None
+
+
+def _reachable_existing_panel(pytype, cur_desktop):
+    """Return an already-open Kitsu pane tab the artist can actually SEE,
+    or None. A tab that exists but sits on another desktop or in a pane
+    collapsed on a split would accept setIsCurrentTab() without error
+    while remaining invisible, which is indistinguishable from the shelf
+    button doing nothing."""
+    for tab in hou.ui.paneTabs():
+        if tab.type() != hou.paneTabType.PythonPanel:
+            continue
+        if tab.activeInterface() != pytype:
+            continue
+        pane = tab.pane()
+        if pane is None:
+            # No pane means a stripped-down floating panel, i.e. one left
+            # over from the old createFloatingPaneTab() code path. It has
+            # no tab strip and can't be docked, but it IS a visible
+            # window, so reuse it rather than opening a second one.
+            if tab.isFloating():
+                return tab
+            continue
+        if pane.desktop() != cur_desktop:
+            continue
+        if pane.isSplitMinimized():
+            continue
+        return tab
+    return None
+
+
+def _raise_window_of(tab):
+    """Bring the window containing `tab` to the front. Being the current
+    tab isn't enough for a floating window sitting behind Houdini's main
+    one."""
+    window = None
+    floating_panel = tab.floatingPanel()
+    if floating_panel is not None:
+        window = floating_panel.qtParentWindow()
+    if window is None:
+        pane = tab.pane()
+        if pane is not None:
+            window = pane.qtParentWindow()
+    if window is not None:
+        window.raise_()
+        window.activateWindow()
+
+
+def _open_kitsu_panel():
+    # Runs from Houdini's idle callback, NOT inside the shelf click's own
+    # call stack (see the executeDeferred() call at the bottom), so it
+    # needs its own error reporting: the try/except down there has long
+    # since returned by the time this runs. Reported as a dialog because
+    # Houdini otherwise surfaces a shelf tool exception only as a small
+    # status-bar icon, which looks identical to the button doing nothing.
+    try:
+        pytype = hou.pypanel.interfaces().get(_INTERFACE_NAME)
+        if pytype is None:
+            raise RuntimeError(
+                f"The '{_INTERFACE_NAME}' Python Panel interface isn't "
+                "registered. Check that this project's HOUDINI_PATH "
+                "includes its kitsu_houdini_plugin folder."
+            )
+
+        cur_desktop = hou.ui.curDesktop()
+
+        existing = _reachable_existing_panel(pytype, cur_desktop)
+        if existing is not None:
+            existing.setIsCurrentTab()
+            _raise_window_of(existing)
+            return
+
+        position, size = _floating_geometry()
+        geometry = {}
+        if position is not None and size is not None:
+            geometry["position"] = position
+            geometry["size"] = size
+
+        # createFloatingPanel(), not createFloatingPaneTab(): only the
+        # former produces a window with a real, draggable tab strip that
+        # can be docked into a pane. The interface name is passed here
+        # rather than via a separate setActiveInterface() call: one
+        # window/GL operation instead of two. See the top-of-file note on
+        # both points.
+        floating_panel = cur_desktop.createFloatingPanel(
+            hou.paneTabType.PythonPanel,
+            python_panel_interface=_INTERFACE_NAME,
+            **geometry,
+        )
+        floating_panel.setName("Kitsu")
+
+        # Houdini can hide the tab strip when a pane holds only one tab,
+        # which would leave nothing visible to grab to dock this later.
+        for pane in floating_panel.panes():
+            pane.showPaneTabs(True)
+    except Exception as exc:
+        hou.ui.displayMessage(
+            f"Could not open the Kitsu panel: {exc}",
+            severity=hou.severityType.Error,
+            title="Kitsu",
+            details=traceback.format_exc(),
+        )
+
+
+try:
+    import hdefereval
+except ImportError:
+    # No idle-callback module available (unusual in a GUI session): still
+    # better to open the panel synchronously than not at all.
+    _open_kitsu_panel()
+else:
+    hdefereval.executeDeferred(_open_kitsu_panel)
 ]]></script>
   </tool>
 
